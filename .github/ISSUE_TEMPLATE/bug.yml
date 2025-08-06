@@ -1,0 +1,28 @@
+name: バグ報告
+description: バグを報告する
+labels: [bug]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: 概要
+      placeholder: 何が起きたかを簡潔に説明してください。
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 再現手順
+      placeholder: バグを再現する手順を箇条書きで書いてください。
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期待される挙動
+      placeholder: 本来期待される挙動を説明してください。
+  - type: textarea
+    id: environment
+    attributes:
+      label: 環境情報
+      placeholder: OS や Python バージョンなど

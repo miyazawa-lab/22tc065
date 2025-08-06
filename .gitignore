@@ -1,0 +1,66 @@
+# Ignore build artifacts
+# --- C/C++ Build Files ---
+*.o
+*.out
+*.exe
+*.a
+*.so
+
+# --- Python ---
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+.env/
+.venv/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# pip install editable
+*.egg-info/
+
+# mypy, coverage, test results
+.mypy_cache/
+.coverage
+htmlcov/
+.pytest_cache/
+
+# --- Go ---
+# Go build artifacts
+*.exe
+*.test
+*.out
+
+# Dependency directories
+vendor/
+
+# Module cache (Go >=1.18 can use `GOMODCACHE`)
+Gopkg.lock
+Gopkg.toml
+
+# --- Rust ---
+# Cargo build artifacts
+/target/
+
+# Rust/Cargo specific
+**/*.rs.bk
+
+# Other
+Cargo.lock
+
+# --- LaTeX ---
+*.aux
+*.log
+*.toc
+*.pdf
+
+# --- macOS ---
+.DS_Store
+
+# --- IDEs and editors ---
+.vscode/
+.idea/
