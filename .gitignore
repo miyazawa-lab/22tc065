@@ -56,7 +56,6 @@ Cargo.lock
 *.aux
 *.log
 *.toc
-*.pdf
 
 # --- macOS ---
 .DS_Store
