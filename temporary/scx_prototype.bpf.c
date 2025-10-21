@@ -38,15 +38,42 @@ static __always_inline void classify_task(struct task_struct *p, __u64 *deadline
 	&cls = 2;
 }
 
+/*select_cpu → enqueue → dispatch
+select_cpuで直入れしたらenqueueは飛ばされる
+*/
 s32 BPF_STRUCT_OPS(prototype_select_cpu, struct *p, s32 prev_cpu, u64 wake_flags)
 {
-
+	u32 cpu;
+	cpu = decide_cpu(p, prev_cpu);
+	if(cpu >= 0) {
+		if(!(p->dl_throttled == 1 && p->dl_non_contending == 1)) {
+			if(realtive_time >= 0 && relative_time <= border) {
+				scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, /*SCX_SLICE_DEF*/, enq_flags);
+				return cpu;
+			}
+		}
+	}
+	return prev_cpu
     classify_task(p );
 }
 
 void BPF_STRUCT_OPS(prototype_enqueue, struct task_struct *p, u64 enq_flags)
 {
-
+	u32 relative_time = p->dl.runtime;
+	u32 absolute_time = p->dl.deadline;
+	const u64  border = 1000000ULL;
+	const u64  now_border = 1000000ULL;
+	const u64  later_border = 1000000ULL;
+	if(!(p->dl_throttled == 1 && p->dl_non_contending == 1)) {
+		if(relative_time <= new_border) {
+			scx_bpf_dsq_insert(p, FAST, /*SCX_SLICE_DEF*/, enq_flags);
+			scx_bpf_dsq_insert(p, NORMAL, /*SCX_SLICE_DEF*/, enq_flags);
+			return;
+		}
+		
+	}
+	
+		
 }
 
 void BPF_STRUCT_OPS(prototype_dequeue, struct task_struct *p, u64 deq_flags)
