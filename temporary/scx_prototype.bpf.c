@@ -12,6 +12,16 @@ char _license[] SEC("license") "GPL";
 const int[] rising = {67,72,77};
 const int[] decent = {64,69,74};
 
+
+#define DSQ_FAST 1001ULL
+#define DSQ_ALWAYS 1002ULL
+#define DSQ_NORMAL 1003ULL
+#define DSQ_LATER 1004ULL
+
+#define SLACK_NS 500000ULL
+#define DL_SMALL_NS 1000000ULL
+#define CFS_UTIL_SMALL 128   
+
 int stage = 0;
 
 struct temp_rec {
@@ -41,20 +51,41 @@ static __always_inline void classify_task(struct task_struct *p, __u64 *deadline
 /*select_cpu → enqueue → dispatch
 select_cpuで直入れしたらenqueueは飛ばされる
 */
-s32 BPF_STRUCT_OPS(prototype_select_cpu, struct *p, s32 prev_cpu, u64 wake_flags)
+
+static __always_inline bool determine_tof(const struct task_struct *p)
+{
+	if ((p->policy == SCHED_DEADLINE) || p->dl_throttled == 1 || p->dl_non_contending == 1)
+		return false;
+    if ((s64)p->dl.runtime <= 0)
+        return false;
+	if (p->dl.dl_boosted)
+        return true;
+	s64 laxity = (s64)p->dl.deadline - (s64)scx_bpf_now() - (s64)p->dl.runtime;
+	//return p->policy == SCHED_DEADLINE && p->dl.pi_se && (p->dl.pi_se != &p->dl);
+    return laxity > 0;
+}
+
+static __always_inline bool determine_sz(const struct task_struct *p)
+{
+    if (is_sched_dl(p))
+        return (u64)p->dl.runtime <= (u64)DL_SMALL_NS;
+    return p->se.avg.util_avg <= CFS_UTIL_SMALL;
+}
+
+s32 BPF_STRUCT_OPS(prototype_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 {
 	u32 cpu;
 	cpu = decide_cpu(p, prev_cpu);
 	if(cpu >= 0) {
-		if(!(p->dl_throttled == 1 && p->dl_non_contending == 1)) {
-			if(realtive_time >= 0 && relative_time <= border) {
+		if(determine_tof(p)) {
+		s64 laxity = (s64)p->dl.deadline - (s64)scx_bpf_now() - (s64)p->dl.runtime;
+			if(laxity - SLACK_NS > 0) {
 				scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, /*SCX_SLICE_DEF*/, enq_flags);
 				return cpu;
 			}
 		}
 	}
 	return prev_cpu
-    classify_task(p );
 }
 
 void BPF_STRUCT_OPS(prototype_enqueue, struct task_struct *p, u64 enq_flags)
@@ -64,16 +95,16 @@ void BPF_STRUCT_OPS(prototype_enqueue, struct task_struct *p, u64 enq_flags)
 	const u64  border = 1000000ULL;
 	const u64  now_border = 1000000ULL;
 	const u64  later_border = 1000000ULL;
-	if(!(p->dl_throttled == 1 && p->dl_non_contending == 1)) {
+	if(determine_tof(p)) {
 		if(relative_time <= new_border) {
 			scx_bpf_dsq_insert(p, FAST, /*SCX_SLICE_DEF*/, enq_flags);
-			scx_bpf_dsq_insert(p, NORMAL, /*SCX_SLICE_DEF*/, enq_flags);
+			scx_bpf_dsq_insert(p, ALWAYS, /*SCX_SLICE_DEF*/, enq_flags);
 			return;
-		}
-		
+		}	
 	}
+	scx_bpf_dsq_insert(p, NORMAL, /*SCX_SLICE_DEF*/, enq_flags);
+	scx_bpf_dsq_insert(p, LATER, /*SCX_SLICE_DEF*/, enq_flags);
 	
-		
 }
 
 void BPF_STRUCT_OPS(prototype_dequeue, struct task_struct *p, u64 deq_flags)
