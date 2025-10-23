@@ -12,6 +12,7 @@ char _license[] SEC("license") "GPL";
 const int[] rising = {67,72,77};
 const int[] decent = {64,69,74};
 
+const;
 
 #define DSQ_FAST 1001ULL
 #define DSQ_ALWAYS 1002ULL
@@ -75,7 +76,7 @@ static __always_inline bool determine_sz(const struct task_struct *p)
 s32 BPF_STRUCT_OPS(prototype_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 {
 	u32 cpu;
-	cpu = decide_cpu(p, prev_cpu);
+	cpu = pick_direct_dispatch_cpu(p, prev_cpu);
 	if(cpu >= 0) {
 		if(determine_tof(p)) {
 		s64 laxity = (s64)p->dl.deadline - (s64)scx_bpf_now() - (s64)p->dl.runtime;
@@ -90,20 +91,23 @@ s32 BPF_STRUCT_OPS(prototype_select_cpu, struct task_struct *p, s32 prev_cpu, u6
 
 void BPF_STRUCT_OPS(prototype_enqueue, struct task_struct *p, u64 enq_flags)
 {
-	u32 relative_time = p->dl.runtime;
-	u32 absolute_time = p->dl.deadline;
 	const u64  border = 1000000ULL;
 	const u64  now_border = 1000000ULL;
 	const u64  later_border = 1000000ULL;
 	if(determine_tof(p)) {
-		if(relative_time <= new_border) {
-			scx_bpf_dsq_insert(p, FAST, /*SCX_SLICE_DEF*/, enq_flags);
-			scx_bpf_dsq_insert(p, ALWAYS, /*SCX_SLICE_DEF*/, enq_flags);
+		if(p->dl.runtime <= new_border) {
+			if ((bpf_get_prandom_u32() & 1) == 0)
+				scx_bpf_dsq_insert(p, FAST, /*SCX_SLICE_DEF*/, enq_flags);
+			else
+				scx_bpf_dsq_insert(p, ALWAYS, /*SCX_SLICE_DEF*/, enq_flags);
 			return;
-		}	
+		}
+		if ((bpf_get_prandom_u32() & 1) == 0)
+			scx_bpf_dsq_insert_vtime(p, NORMAL, /*SCX_SLICE_DEF*/, enq_flags);
+		else
+			scx_bpf_dsq_insert_vtime(p, LATER, /*SCX_SLICE_DEF*/, enq_flags);
 	}
-	scx_bpf_dsq_insert(p, NORMAL, /*SCX_SLICE_DEF*/, enq_flags);
-	scx_bpf_dsq_insert(p, LATER, /*SCX_SLICE_DEF*/, enq_flags);
+
 	
 }
 
