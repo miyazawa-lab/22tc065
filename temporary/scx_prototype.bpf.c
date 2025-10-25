@@ -75,18 +75,39 @@ static __always_inline bool determine_sz(const struct task_struct *p)
 
 s32 BPF_STRUCT_OPS(prototype_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 {
-	u32 cpu;
+/*	u32 cpu;
 	cpu = pick_direct_dispatch_cpu(p, prev_cpu);
 	if(cpu >= 0) {
 		if(determine_tof(p)) {
 		s64 laxity = (s64)p->dl.deadline - (s64)scx_bpf_now() - (s64)p->dl.runtime;
 			if(laxity - SLACK_NS > 0) {
-				scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, /*SCX_SLICE_DEF*/, enq_flags);
+				scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, /*SCX_SLICE_DEF, enq_flags);
 				return cpu;
 			}
 		}
 	}
-	return prev_cpu
+	return prev_cpu;
+*/
+	if (cpu < 0) {
+        bool direct = false;
+        s32 dfl = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &direct);
+        if (direct)
+            scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
+        return dfl;
+    }
+	enum bucket b = classify_deadline_task(p, now);
+
+    if (b == BUCKET_NOW) {
+#if defined(HAVE_LOCAL_ON_DIRECT_DISPATCH)
+        scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | (u32)cpu, SLICE_NOW_NS ? SLICE_NOW_NS : SCX_SLICE_DFL, 0);
+#else
+        scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SLICE_NOW_NS ? SLICE_NOW_NS : SCX_SLICE_DFL, 0);
+#endif
+        return cpu;
+    }
+    u64 dsq = later_dsq_pick(p);
+    scx_bpf_dsq_insert(p, dsq, SLICE_LATER_NS ? SLICE_LATER_NS : SCX_SLICE_DFL, 0);
+    return cpu;
 }
 
 void BPF_STRUCT_OPS(prototype_enqueue, struct task_struct *p, u64 enq_flags)
@@ -116,12 +137,88 @@ void BPF_STRUCT_OPS(prototype_dequeue, struct task_struct *p, u64 deq_flags)
 
 }
 
-
 void BPF_STRUCT_OPS(prototype_dispatch, s32 cpu, struct task_struct *prev)
 {
-
+	
+	
 }
 
+/*
+void BPF_STRUCT_OPS(prototype_dispatch, s32 cpu, struct task_struct *prev)
+{
+    __u32 zero = 0, one = 1, two = 2;
+    __u32 *now_rr  = bpf_map_lookup_elem(&scx_rr_state, &zero);
+    __u32 *ltr_rr  = bpf_map_lookup_elem(&scx_rr_state, &one);
+    __u32 *quota   = bpf_map_lookup_elem(&scx_rr_state, &two); 
+
+    if (!now_rr || !ltr_rr || !quota) {
+        return;
+    }
+
+    __u32 slots = scx_bpf_dispatch_nr_slots();
+    if (!slots)
+        return;
+
+    if (*quota == 0)
+        *quota = NOW_BURST;
+
+    for (; slots > 0; ) {
+        bool moved = false;
+
+        while (*quota > 0 && slots > 0) {
+            __u64 dsq_now = (*now_rr == 0) ? DSQ_FAST : DSQ_ALWAYS;
+            *now_rr ^= 1; 
+
+            if (scx_bpf_dsq_move_to_local(dsq_now)) {
+                moved = true;
+                (*quota)--;
+                slots--;
+            } else {
+                __u64 dsq_alt = (*now_rr == 0) ? DSQ_FAST : DSQ_ALWAYS;
+                *now_rr ^= 1;
+
+                if (scx_bpf_dsq_move_to_local(dsq_alt)) {
+                    moved = true;
+                    (*quota)--;
+                    slots--;
+                } else {
+                    *quota = 0;
+                    break;
+                }
+            }
+        }
+        if (slots > 0) {
+            __u32 ltr_try = LTR_BURST;
+
+            while (ltr_try-- > 0 && slots > 0) {
+                __u64 dsq_ltr = (*ltr_rr == 0) ? DSQ_NORMAL : DSQ_LATER;
+                *ltr_rr ^= 1;
+                if (scx_bpf_dsq_move_to_local(dsq_ltr)) {
+                    moved = true;
+                    slots--;
+                } else {
+                    __u64 dsq_alt = (*ltr_rr == 0) ? DSQ_NORMAL : DSQ_LATER;
+                    *ltr_rr ^= 1;
+                    if (scx_bpf_dsq_move_to_local(dsq_alt)) {
+                        moved = true;
+                        slots--;
+                    }
+                }
+            }
+        }
+        if (!moved) {
+            if (scx_bpf_dsq_move_to_local(SCX_DSQ_GLOBAL)) {
+                slots--;
+                continue;
+            }
+            break;
+        }
+
+        if (*quota == 0)
+            *quota = NOW_BURST;
+    }
+}
+*/
 struct trace_event_raw_thermal_temperature *ctx;
 
 SEC("tracepoint/therm/thermal_temperature")
