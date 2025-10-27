@@ -12,7 +12,7 @@ char _license[] SEC("license") "GPL";
 const int[] rising = {67,72,77};
 const int[] decent = {64,69,74};
 
-const;
+const　s32 aloowed[3] = {0, 1, 2};
 
 #define DSQ_FAST 1001ULL
 #define DSQ_ALWAYS 1002ULL
@@ -23,12 +23,20 @@ const;
 #define DL_SMALL_NS 1000000ULL
 #define CFS_UTIL_SMALL 128   
 
+#define CPU_NUM 4
+
 int stage = 0;
+
+enum { STG_COOL, STG_WARM, STG_HOT, STG_NR };
 
 struct temp_rec {
     int id;
     int temp;
 
+};
+
+struct ratio {
+	u32 now, later;
 };
 
 struct {
@@ -38,6 +46,15 @@ struct {
     __type(value, struct metric_val);
     __uint(pinning, LIBBPF_PIN_BY_NAME);
 } metrics SEC(".maps");
+
+const volatile struct ratio g_ratio[STG_NR] = {
+    [STG_COOL] = {5, 3}, [STG_WARM] = {7, 3}, [STG_HOT] = {3, 1},
+};
+
+const volatile __u64 NOW_DSQ = 0x1000ULL;
+const volatile __u64 LATER_DSQ = 0x2000ULL;
+
+volatile __u32 g_rr_cpu;
 
 static __always_inline void classify_task(struct task_struct *p, __u64 *deadline_ns, int *cls)
 {
@@ -66,6 +83,27 @@ static __always_inline bool determine_tof(const struct task_struct *p)
     return laxity > 0;
 }
 
+static __always_inline bool cpu_online(s32 cpu)
+{
+    const struct cpumask *online = scx_bpf_get_online_cpumask();
+    return online && cpu >= 0 && bpf_cpumask_test_cpu(cpu, online);
+}
+
+static __always_inline s32 pick_idle_cpu012(void)
+{
+    const struct cpumask *idle = scx_bpf_get_idle_cpumask();
+    if (!idle) 
+		return -1;
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < 3; i++) {
+        s32 cpu = ALLOWED[i];
+        if (bpf_cpumask_test_cpu(cpu, idle) && cpu_online(cpu))
+            return cpu;
+    }
+    return -1;
+}
+
+
 static __always_inline bool determine_sz(const struct task_struct *p)
 {
     if (is_sched_dl(p))
@@ -75,19 +113,20 @@ static __always_inline bool determine_sz(const struct task_struct *p)
 
 s32 BPF_STRUCT_OPS(prototype_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 {
-/*	u32 cpu;
-	cpu = pick_direct_dispatch_cpu(p, prev_cpu);
+	u32 cpu;
+	cpu = pick_idle_cpu012();
 	if(cpu >= 0) {
 		if(determine_tof(p)) {
 		s64 laxity = (s64)p->dl.deadline - (s64)scx_bpf_now() - (s64)p->dl.runtime;
-			if(laxity - SLACK_NS > 0) {
-				scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, /*SCX_SLICE_DEF, enq_flags);
+			if(SLACK_NS - laxity> 0) {
+				scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, /*SCX_SLICE_DEF*/, enq_flags);
 				return cpu;
 			}
 		}
 	}
 	return prev_cpu;
-*/
+	
+/*
 	if (cpu < 0) {
         bool direct = false;
         s32 dfl = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &direct);
@@ -108,6 +147,7 @@ s32 BPF_STRUCT_OPS(prototype_select_cpu, struct task_struct *p, s32 prev_cpu, u6
     u64 dsq = later_dsq_pick(p);
     scx_bpf_dsq_insert(p, dsq, SLICE_LATER_NS ? SLICE_LATER_NS : SCX_SLICE_DFL, 0);
     return cpu;
+	*/
 }
 
 void BPF_STRUCT_OPS(prototype_enqueue, struct task_struct *p, u64 enq_flags)
@@ -139,8 +179,11 @@ void BPF_STRUCT_OPS(prototype_dequeue, struct task_struct *p, u64 deq_flags)
 
 void BPF_STRUCT_OPS(prototype_dispatch, s32 cpu, struct task_struct *prev)
 {
-	
-	
+	__u32 slots = scx_bpf_dispatch_nr_slots();
+    for (__u32 i = 0; i < slots; i++) {
+        if (!dispatch_one_weighted())
+            break;
+    }	
 }
 
 /*
