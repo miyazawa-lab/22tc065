@@ -111,13 +111,84 @@ static __always_inline bool determine_sz(const struct task_struct *p)
     return p->se.avg.util_avg <= CFS_UTIL_SMALL;
 }
 
+static __always_inline s32 pick_target_cpu(void)
+{
+    const struct cpumask *idle = scx_bpf_get_idle_cpumask();
+    if (idle) {
+        for (int i = 0; i < 4; i++) {
+            s32 cand = (g_rr_cpu + i) & 3;
+            if (bpf_cpumask_test_cpu(cand, idle))
+                return cand;
+        }
+    }
+    s32 best = -1; __u64 best_depth = ~0ULL;
+    for (int cpu = 0; cpu < 4; cpu++) {
+        __u64 depth = scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | cpu);
+        if (depth < best_depth) { 
+			best_depth = depth;
+			best = cpu;
+		}
+    }
+    g_rr_cpu = best + 1;
+    return best >= 0 ? best & 3 : bpf_get_smp_processor_id();
+}
+
+static __always_inline bool move_one(__u64 src_dsq, s32 target_cpu)
+{
+    s32 this_cpu = bpf_get_smp_processor_id();
+
+    if (target_cpu == this_cpu)
+        return scx_bpf_dsq_move_to_local(src_dsq);
+
+    struct bpf_iter_scx_dsq it;
+    if (bpf_iter_scx_dsq_new(&it, src_dsq, 0))
+        return false;
+
+    struct task_struct *p;
+    bool ok = false;
+    while ((p = bpf_iter_scx_dsq_next(&it))) {
+        ok = __COMPAT_scx_bpf_dsq_move(&it, p, SCX_DSQ_LOCAL_ON | target_cpu, 0);
+        if (ok) break;
+    }
+    bpf_iter_scx_dsq_destroy(&it);
+    return true;
+}
+
+static __always_inline bool dispatch_one_weighted(void)
+{
+    static __u32 credit_now, credit_later;
+    const struct ratio r = g_ratio[g_stage];
+
+    if (credit_now == 0 && credit_later == 0) {
+        credit_now = r.now; 
+		credit_later = r.later;
+	}
+	
+    bool try_now = (credit_now >= credit_later);
+
+    for (int turn = 0; turn < 2; turn++) {
+        __u64 dsq = try_now ? NOW_DSQ : LATER_DSQ;
+        s32 target = pick_target_cpu();
+        if (move_one(dsq, target)) {
+            if (try_now) 
+				credit_now--; 
+			else 
+				credit_later--;
+            g_rr_cpu++;
+            return true;
+        }
+        try_now = !try_now;
+    }
+    return false;
+}
+
 s32 BPF_STRUCT_OPS(prototype_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 {
 	u32 cpu;
 	cpu = pick_idle_cpu012();
 	if(cpu >= 0) {
 		if(determine_tof(p)) {
-		s64 laxity = (s64)p->dl.deadline - (s64)scx_bpf_now() - (s64)p->dl.runtime;
+		s64 laxity = (s64)p->dl.deadline - (s64)bpf_ktime_get_ns()- (s64)p->dl.runtime;
 			if(SLACK_NS - laxity> 0) {
 				scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, /*SCX_SLICE_DEF*/, enq_flags);
 				return cpu;
