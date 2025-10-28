@@ -56,19 +56,54 @@ const volatile __u64 LATER_DSQ = 0x2000ULL;
 
 volatile __u32 g_rr_cpu;
 
-static __always_inline void classify_task(struct task_struct *p, __u64 *deadline_ns, int *cls)
-{
-    if(&deadline <= 2000000)
-	&cls = 0;
-    else if(&deadline <= 15000000)
-	&cls = 1;
-    else
-	&cls = 2;
-}
-
-/*select_cpu → enqueue → dispatch
+/*
+select_cpu → enqueue → dispatch
 select_cpuで直入れしたらenqueueは飛ばされる
 */
+
+const volatile __s32 rising_degC[4] = { 0, 67, 72, 77 };
+const volatile __s32 falling_degC[4] = { 0, 64, 69, 74 };
+
+
+
+const volatile __s32 g_filter_tz_id = -1;
+
+
+volatile __u32 g_stage = STG_COOL;
+
+
+static __always_inline __u32
+next_stage_hysteresis(__u32 cur, int temp_mC,
+                      const __s32 *rC, const __s32 *dC)
+{
+    const int r_warm_mC = rC[1] * 1000;
+    const int r_hot_mC  = rC[2] * 1000;
+
+    const int d_warm_mC = dC[1] * 1000;
+    const int d_cool_mC = dC[1] ? dC[0] * 1000 : 0; 
+
+    switch (cur) {
+    case STG_COOL:
+        if (temp_mC >= r_warm_mC) return STG_WARM;
+        return STG_COOL;
+
+    case STG_WARM:
+        if (temp_mC >= r_hot_mC)      
+			return STG_HOT;
+        if (temp_mC <  (falling_degC[0] ? d_cool_mC : r_warm_mC - 3000))
+            return STG_COOL;
+        return STG_WARM;
+
+    case STG_HOT:
+        if (temp_mC <  d_warm_mC)    
+			return STG_WARM;
+		
+		return STG_HOT;
+    }
+    if (temp_mC >= r_hot_mC)  return STG_HOT;
+    if (temp_mC >= r_warm_mC) return STG_WARM;
+    return STG_COOL;
+}
 
 static __always_inline bool determine_tof(const struct task_struct *p)
 {
@@ -196,29 +231,6 @@ s32 BPF_STRUCT_OPS(prototype_select_cpu, struct task_struct *p, s32 prev_cpu, u6
 		}
 	}
 	return prev_cpu;
-	
-/*
-	if (cpu < 0) {
-        bool direct = false;
-        s32 dfl = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &direct);
-        if (direct)
-            scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
-        return dfl;
-    }
-	enum bucket b = classify_deadline_task(p, now);
-
-    if (b == BUCKET_NOW) {
-#if defined(HAVE_LOCAL_ON_DIRECT_DISPATCH)
-        scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | (u32)cpu, SLICE_NOW_NS ? SLICE_NOW_NS : SCX_SLICE_DFL, 0);
-#else
-        scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SLICE_NOW_NS ? SLICE_NOW_NS : SCX_SLICE_DFL, 0);
-#endif
-        return cpu;
-    }
-    u64 dsq = later_dsq_pick(p);
-    scx_bpf_dsq_insert(p, dsq, SLICE_LATER_NS ? SLICE_LATER_NS : SCX_SLICE_DFL, 0);
-    return cpu;
-	*/
 }
 
 void BPF_STRUCT_OPS(prototype_enqueue, struct task_struct *p, u64 enq_flags)
@@ -227,17 +239,10 @@ void BPF_STRUCT_OPS(prototype_enqueue, struct task_struct *p, u64 enq_flags)
 	const u64  now_border = 1000000ULL;
 	const u64  later_border = 1000000ULL;
 	if(determine_tof(p)) {
-		if(p->dl.runtime <= new_border) {
-			if ((bpf_get_prandom_u32() & 1) == 0)
-				scx_bpf_dsq_insert(p, FAST, /*SCX_SLICE_DEF*/, enq_flags);
-			else
-				scx_bpf_dsq_insert(p, ALWAYS, /*SCX_SLICE_DEF*/, enq_flags);
-			return;
-		}
-		if ((bpf_get_prandom_u32() & 1) == 0)
-			scx_bpf_dsq_insert_vtime(p, NORMAL, /*SCX_SLICE_DEF*/, enq_flags);
+		if(p->dl.runtime <= new_border) 
+			scx_bpf_dsq_insert(p, FAST, /*SCX_SLICE_DEF*/, enq_flags);
 		else
-			scx_bpf_dsq_insert_vtime(p, LATER, /*SCX_SLICE_DEF*/, enq_flags);
+			scx_bpf_dsq_insert_vtime(p, NORMAL, /*SCX_SLICE_DEF*/, enq_flags);
 	}
 
 	
@@ -257,98 +262,21 @@ void BPF_STRUCT_OPS(prototype_dispatch, s32 cpu, struct task_struct *prev)
     }	
 }
 
-/*
-void BPF_STRUCT_OPS(prototype_dispatch, s32 cpu, struct task_struct *prev)
-{
-    __u32 zero = 0, one = 1, two = 2;
-    __u32 *now_rr  = bpf_map_lookup_elem(&scx_rr_state, &zero);
-    __u32 *ltr_rr  = bpf_map_lookup_elem(&scx_rr_state, &one);
-    __u32 *quota   = bpf_map_lookup_elem(&scx_rr_state, &two); 
 
-    if (!now_rr || !ltr_rr || !quota) {
-        return;
-    }
-
-    __u32 slots = scx_bpf_dispatch_nr_slots();
-    if (!slots)
-        return;
-
-    if (*quota == 0)
-        *quota = NOW_BURST;
-
-    for (; slots > 0; ) {
-        bool moved = false;
-
-        while (*quota > 0 && slots > 0) {
-            __u64 dsq_now = (*now_rr == 0) ? DSQ_FAST : DSQ_ALWAYS;
-            *now_rr ^= 1; 
-
-            if (scx_bpf_dsq_move_to_local(dsq_now)) {
-                moved = true;
-                (*quota)--;
-                slots--;
-            } else {
-                __u64 dsq_alt = (*now_rr == 0) ? DSQ_FAST : DSQ_ALWAYS;
-                *now_rr ^= 1;
-
-                if (scx_bpf_dsq_move_to_local(dsq_alt)) {
-                    moved = true;
-                    (*quota)--;
-                    slots--;
-                } else {
-                    *quota = 0;
-                    break;
-                }
-            }
-        }
-        if (slots > 0) {
-            __u32 ltr_try = LTR_BURST;
-
-            while (ltr_try-- > 0 && slots > 0) {
-                __u64 dsq_ltr = (*ltr_rr == 0) ? DSQ_NORMAL : DSQ_LATER;
-                *ltr_rr ^= 1;
-                if (scx_bpf_dsq_move_to_local(dsq_ltr)) {
-                    moved = true;
-                    slots--;
-                } else {
-                    __u64 dsq_alt = (*ltr_rr == 0) ? DSQ_NORMAL : DSQ_LATER;
-                    *ltr_rr ^= 1;
-                    if (scx_bpf_dsq_move_to_local(dsq_alt)) {
-                        moved = true;
-                        slots--;
-                    }
-                }
-            }
-        }
-        if (!moved) {
-            if (scx_bpf_dsq_move_to_local(SCX_DSQ_GLOBAL)) {
-                slots--;
-                continue;
-            }
-            break;
-        }
-
-        if (*quota == 0)
-            *quota = NOW_BURST;
-    }
-}
-*/
-struct trace_event_raw_thermal_temperature *ctx;
 
 SEC("tracepoint/therm/thermal_temperature")
-int tp_thermal(ctx)
+int tp_thermal(struct trace_event_raw_thermal_temperature *ctx;)
 {
-    struct temp_rec tp;
-    tp.id   = ctx->id;
-    tp.temp = ctx->temp;
-    int prev_tmp;
-    if(tp.id > rising[0]) {
-	stage = 3;
-    } else if(tp.id > rising[1]){
-        stage = 2;
-    } else if(tp.id > rising[2]){
-        stage = 1;
-    }
+    if (g_filter_tz_id >= 0 && ctx->id != g_filter_tz_id)
+        return 0;
+
+    const int temp_mC = ctx->temp;
+
+    __u32 cur = g_stage;
+    __u32 nxt = next_stage_hysteresis(cur, temp_mC, rising_degC, falling_degC);
+    if (nxt != cur)
+        g_stage = nxt;
+
     return 0;
 }
 
