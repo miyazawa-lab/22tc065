@@ -243,7 +243,7 @@ s32 BPF_STRUCT_OPS(prototype_select_cpu, struct task_struct *p, s32 prev_cpu, u6
 		if(determine_tof(p)) {
 		s64 laxity = (s64)p->dl.deadline - (s64)bpf_ktime_get_ns()- (s64)p->dl.runtime;
 			if((s64)get_slack_ns() - laxity> 0) {
-				scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, /*SCX_SLICE_DFL*/, 0);
+				scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, SCX_SLICE_DFL, 0);
 				return cpu;
 			}
 		}
@@ -255,9 +255,9 @@ void BPF_STRUCT_OPS(prototype_enqueue, struct task_struct *p, u64 enq_flags)
 {
 	if(determine_tof(p)) {
 		if(p->dl.runtime <= get_now_border_ns()) 
-			scx_bpf_dsq_insert(p, FAST, /*SCX_SLICE_DFL*/, enq_flags);
+			scx_bpf_dsq_insert(p, FAST, SCX_SLICE_DFL, enq_flags);
 		else
-			scx_bpf_dsq_insert_vtime(p, NORMAL, /*SCX_SLICE_DFL*/, (u64)p->dl.deadline, enq_flags);
+			scx_bpf_dsq_insert_vtime(p, NORMAL, SCX_SLICE_DFL, (u64)p->dl.deadline, enq_flags);
 	}
 }
 
