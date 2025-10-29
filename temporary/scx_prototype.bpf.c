@@ -72,9 +72,7 @@ const volatile __s32 g_filter_tz_id = -1;
 volatile __u32 g_stage = STG_COOL;
 
 
-static __always_inline __u32
-next_stage_hysteresis(__u32 cur, int temp_mC,
-                      const __s32 *rC, const __s32 *dC)
+static __always_inline __u32 next_stage_hysteresis(__u32 cur, int temp_mC, const __s32 *rC, const __s32 *dC)
 {
     const int r_warm_mC = rC[1] * 1000;
     const int r_hot_mC  = rC[2] * 1000;
@@ -296,7 +294,19 @@ void BPF_STRUCT_OPS(prototype_exit, struct scx_exit_info *ei)
     scx_bpf_destroy_dsq(FALLBACK_DSQ_ID);
 }
 
+s32 BPF_STRUCT_OPS(prototype_init_task, struct task_struct *p, struct scx_init_task_args *args) 
+{
+	return 0;
+}
+
 SCX_OPS_DEFINE(prototype_ops,
+.select_cpu = (void *)prototype_select_cpu,
+.enqueue = (void *)prototype_enqueue,
+.dispatch = (void *)prototype_dispatch,
+.dequeue = (void *)prototype_dequeue,
+.init = (void *)prototype_init,
+.init_task = (void *)prototype_init_task,
+.exit = (void *)prototype_exit,
 . = (void *)prototype_,
 
 .name = "scx_prototype");
