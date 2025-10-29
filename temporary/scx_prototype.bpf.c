@@ -298,6 +298,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(prototype_init)
 {
     scx_bpf_create_dsq(FAST, -1);
     scx_bpf_create_dsq(NORMAL, -1);
+	scx_bpf_switch_all();
     //scx_bpf_create_dsq(GOAWAY, -1);
     //scx_bpf_create_dsq(EMERGENCY, -1);
     //scx_bpf_create_dsq(ALWAYS, -1);
