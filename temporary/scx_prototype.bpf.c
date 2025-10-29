@@ -67,17 +67,17 @@ const volatile __s32 g_filter_tz_id = -1;
 
 volatile __u32 g_stage = STG_COOL;
 
-static __always_inline __u64 get_slack_ns(void)     
+static __always_inline __u64 get_slack_ns(void)
 {
-	return g_tune[g_stage].slack_ns; 
+    return (g_stage == STG_NR) ? g_tune_nr.slack_ns : g_tune[g_stage].slack_ns;
 }
-
-static __always_inline __u64 get_now_border_ns(void) { 
-	return g_tune[g_stage].now_border_ns;
+static __always_inline __u64 get_now_border_ns(void)
+{
+    return (g_stage == STG_NR) ? g_tune_nr.now_border_ns : g_tune[g_stage].now_border_ns;
 }
-
-static __always_inline __u64 get_dl_small_ns(void)   { 
-	return g_tune[g_stage].dl_small_ns; 
+static __always_inline __u64 get_dl_small_ns(void)
+{
+    return (g_stage == STG_NR) ? g_tune_nr.dl_small_ns : g_tune[g_stage].dl_small_ns;
 }
 
 static __always_inline __u32 next_stage_hysteresis(__u32 cur, int temp_mC, const __s32 *rC, const __s32 *dC)
@@ -123,7 +123,6 @@ static __always_inline bool determine_tof(const struct task_struct *p)
 	if (p->dl.dl_boosted)
         return true;
 	s64 laxity = (s64)p->dl.deadline - (s64)bpf_ktime_get_ns() - (s64)p->dl.runtime;
-	//return p->policy == SCHED_DEADLINE && p->dl.pi_se && (p->dl.pi_se != &p->dl);
     return laxity > 0;
 }
 
@@ -251,7 +250,8 @@ void BPF_STRUCT_OPS(prototype_enqueue, struct task_struct *p, u64 enq_flags)
 			scx_bpf_dsq_insert(p, FAST, SCX_SLICE_DFL, enq_flags);
 		else
 			scx_bpf_dsq_insert_vtime(p, NORMAL, SCX_SLICE_DFL, (u64)p->dl.deadline, enq_flags);
-	}
+	} else
+		scx_bpf_dsq_insert(p, NORMAL, SCX_SLICE_DFL, enq_flags);
 }
 
 void BPF_STRUCT_OPS(prototype_dequeue, struct task_struct *p, u64 deq_flags)
@@ -280,8 +280,15 @@ int tp_thermal(struct trace_event_raw_thermal_temperature *ctx)
 
     __u32 cur = g_stage;
     __u32 nxt = next_stage_hysteresis(cur, temp_mC, rising_degC, falling_degC);
-    if (nxt != cur)
-        g_stage = nxt;
+    if (nxt != cur) {
+    	g_stage = nxt;
+  		u32 k = 0;
+    	struct credit_pair *c = bpf_map_lookup_elem(&credits, &k);
+    	if (c) { 
+			c->now = 0;
+			c->later = 0; 
+		}
+}
 
     return 0;
 }
