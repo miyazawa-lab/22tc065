@@ -12,8 +12,6 @@ const __s32 ALLOWED_CPUS[3] = {0, 1, 2};
 
 #define FAST 0x1000ULL
 #define NORMAL 0x2000ULL
-//#define DSQ_ALWAYS 1002ULL
-//#define DSQ_LATER 1004ULL
 
 #define SLACK_NS 500000ULL
 #define DL_SMALL_NS 1000000ULL
@@ -40,19 +38,11 @@ struct {
   __type(value, struct credit_pair);
 } credits SEC(".maps");
 
-
-/*
-struct {
-    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-    __uint(max_entries, 1);
-    __type(key, u32);
-    __type(value, struct metric_val);
-    __uint(pinning, LIBBPF_PIN_BY_NAME);
-} metrics SEC(".maps");
-*/
 const volatile struct ratio g_ratio[STG_NR] = {
     [STG_COOL] = {5, 3}, [STG_WARM] = {7, 3}, [STG_HOT] = {3, 1},
 };
+
+const volatile struct ratio g_ratio_nr = { 1, 0 };
 
 struct stage_tunables {
     __u64 slack_ns;
@@ -65,6 +55,8 @@ const volatile struct stage_tunables g_tune[STG_NR] = {
     [STG_WARM] = { 250000ULL,  750000ULL, 1000000ULL },
     [STG_HOT]  = { 200000ULL,  500000ULL, 1000000ULL },
 };
+
+const volatile struct stage_tunables g_tune_nr = { 150000ULL, 250000ULL, 1000000ULL };
 
 volatile __u32 g_rr_cpu;
 
@@ -175,7 +167,8 @@ static __always_inline s32 pick_target_cpu(void)
     }
     s32 best = -1; __u64 best_depth = ~0ULL;
     for (int cpu = 0; cpu < 4; cpu++) {
-        __u64 depth = scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | cpu);
+		s32 depth_raw = scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | cpu);
+		__u64 depth = depth_raw < 0 ? 0 : (__u64)depth_raw;
         if (depth < best_depth) { 
 			best_depth = depth;
 			best = cpu;
@@ -213,7 +206,7 @@ static __always_inline bool dispatch_one_weighted(void)
     
 	if (!c) 
 		return false;
-    const struct ratio r = g_ratio[g_stage];
+    const struct ratio r = (g_stage == STG_NR) ? g_ratio_nr : g_ratio[g_stage];
 	
 	if (c->now == 0 && c->later == 0) {
 		c->now = r.now; 
