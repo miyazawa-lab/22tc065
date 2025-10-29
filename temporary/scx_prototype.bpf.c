@@ -6,14 +6,13 @@
 #include <scx/common.bpf.h>
 
 
-
 char _license[] SEC("license") = "GPL";
 
 const __s32 ALLOWED_CPUS[3] = {0, 1, 2};
 
 #define FAST 0x1000ULL
-//#define DSQ_ALWAYS 1002ULL
 #define NORMAL 0x2000ULL
+//#define DSQ_ALWAYS 1002ULL
 //#define DSQ_LATER 1004ULL
 
 #define SLACK_NS 500000ULL
@@ -29,6 +28,19 @@ enum { STG_COOL, STG_WARM, STG_HOT, STG_NR };
 struct ratio {
 	u32 now, later;
 };
+
+struct credit_pair { 
+	u32 now, later; 
+};
+
+struct {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, u32);
+  __type(value, struct credit_pair);
+} credits SEC(".maps");
+
+
 /*
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -42,17 +54,39 @@ const volatile struct ratio g_ratio[STG_NR] = {
     [STG_COOL] = {5, 3}, [STG_WARM] = {7, 3}, [STG_HOT] = {3, 1},
 };
 
+struct stage_tunables {
+    __u64 slack_ns;
+    __u64 now_border_ns;
+    __u64 dl_small_ns;
+};
+
+const volatile struct stage_tunables g_tune[STG_NR] = {
+    [STG_COOL] = { 300000ULL, 1000000ULL, 1000000ULL },
+    [STG_WARM] = { 250000ULL,  750000ULL, 1000000ULL },
+    [STG_HOT]  = { 200000ULL,  500000ULL, 1000000ULL },
+};
+
 volatile __u32 g_rr_cpu;
-/*
-select_cpu → enqueue → dispatch
-select_cpuで直入れしたらenqueueは飛ばされる
-*/
+
 const volatile __s32 rising_degC[4] = { 0, 67, 72, 77 };
 const volatile __s32 falling_degC[4] = { 0, 64, 69, 74 };
 
 const volatile __s32 g_filter_tz_id = -1;
 
 volatile __u32 g_stage = STG_COOL;
+
+static __always_inline __u64 get_slack_ns(void)     
+{
+	return g_tune[g_stage].slack_ns; 
+}
+
+static __always_inline __u64 get_now_border_ns(void) { 
+	return g_tune[g_stage].now_border_ns;
+}
+
+static __always_inline __u64 get_dl_small_ns(void)   { 
+	return g_tune[g_stage].dl_small_ns; 
+}
 
 static __always_inline __u32 next_stage_hysteresis(__u32 cur, int temp_mC, const __s32 *rC, const __s32 *dC)
 {
@@ -124,8 +158,8 @@ static __always_inline s32 pick_idle_cpu012(void)
 
 static __always_inline bool determine_sz(const struct task_struct *p)
 {
-    if (is_sched_dl(p))
-        return (u64)p->dl.runtime <= (u64)DL_SMALL_NS;
+    if (p->policy == SCHED_DEADLINE)
+        return (u64)p->dl.runtime <= get_dl_small_ns();
     return p->se.avg.util_avg <= CFS_UTIL_SMALL;
 }
 
@@ -174,24 +208,25 @@ static __always_inline bool move_one(__u64 src_dsq, s32 target_cpu)
 
 static __always_inline bool dispatch_one_weighted(void)
 {
-    static __u32 credit_now, credit_later;
+	u32 k = 0;
+    struct credit_pair *c = bpf_map_lookup_elem(&credits, &k);
+    
+	if (!c) 
+		return false;
     const struct ratio r = g_ratio[g_stage];
-
-    if (credit_now == 0 && credit_later == 0) {
-        credit_now = r.now; 
-		credit_later = r.later;
+	
+	if (c->now == 0 && c->later == 0) {
+		c->now = r.now; 
+		c->later = r.later; 
 	}
 	
-    bool try_now = (credit_now >= credit_later);
-
+    bool try_now = (c->now >= c->later);
+    #pragma clang loop unroll(full)
     for (int turn = 0; turn < 2; turn++) {
         __u64 dsq = try_now ? FAST : NORMAL;
         s32 target = pick_target_cpu();
         if (move_one(dsq, target)) {
-            if (try_now) 
-				credit_now--; 
-			else 
-				credit_later--;
+            if (try_now) c->now--; else c->later--;
             g_rr_cpu++;
             return true;
         }
@@ -207,8 +242,8 @@ s32 BPF_STRUCT_OPS(prototype_select_cpu, struct task_struct *p, s32 prev_cpu, u6
 	if(cpu >= 0) {
 		if(determine_tof(p)) {
 		s64 laxity = (s64)p->dl.deadline - (s64)bpf_ktime_get_ns()- (s64)p->dl.runtime;
-			if(SLACK_NS - laxity> 0) {
-				scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, /*SCX_SLICE_DEF*/, 0);
+			if((s64)get_slack_ns() - laxity> 0) {
+				scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, /*SCX_SLICE_DFL*/, 0);
 				return cpu;
 			}
 		}
@@ -218,14 +253,11 @@ s32 BPF_STRUCT_OPS(prototype_select_cpu, struct task_struct *p, s32 prev_cpu, u6
 
 void BPF_STRUCT_OPS(prototype_enqueue, struct task_struct *p, u64 enq_flags)
 {
-	const u64  border = 1000000ULL;
-	const u64  now_border = 1000000ULL;
-	const u64  later_border = 1000000ULL;
 	if(determine_tof(p)) {
-		if(p->dl.runtime <= now_border) 
-			scx_bpf_dsq_insert(p, FAST, /*SCX_SLICE_DEF*/, 0);
+		if(p->dl.runtime <= get_now_border_ns()) 
+			scx_bpf_dsq_insert(p, FAST, /*SCX_SLICE_DFL*/, enq_flags);
 		else
-			scx_bpf_dsq_insert_vtime(p, NORMAL, /*SCX_SLICE_DEF*/, 0);
+			scx_bpf_dsq_insert_vtime(p, NORMAL, /*SCX_SLICE_DFL*/, (u64)p->dl.deadline, enq_flags);
 	}
 }
 
