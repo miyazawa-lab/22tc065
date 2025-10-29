@@ -7,17 +7,14 @@
 
 
 
-char _license[] SEC("license") "GPL";
+char _license[] SEC("license") = "GPL";
 
-const int[] rising = {67,72,77};
-const int[] decent = {64,69,74};
+const __s32 ALLOWED_CPUS[3] = {0, 1, 2};
 
-const　s32 aloowed[3] = {0, 1, 2};
-
-#define DSQ_FAST 1001ULL
-#define DSQ_ALWAYS 1002ULL
-#define DSQ_NORMAL 1003ULL
-#define DSQ_LATER 1004ULL
+#define FAST 0x1000ULL
+//#define DSQ_ALWAYS 1002ULL
+#define NORMAL 0x2000ULL
+//#define DSQ_LATER 1004ULL
 
 #define SLACK_NS 500000ULL
 #define DL_SMALL_NS 1000000ULL
@@ -29,16 +26,10 @@ int stage = 0;
 
 enum { STG_COOL, STG_WARM, STG_HOT, STG_NR };
 
-struct temp_rec {
-    int id;
-    int temp;
-
-};
-
 struct ratio {
 	u32 now, later;
 };
-
+/*
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __uint(max_entries, 1);
@@ -46,72 +37,66 @@ struct {
     __type(value, struct metric_val);
     __uint(pinning, LIBBPF_PIN_BY_NAME);
 } metrics SEC(".maps");
-
+*/
 const volatile struct ratio g_ratio[STG_NR] = {
     [STG_COOL] = {5, 3}, [STG_WARM] = {7, 3}, [STG_HOT] = {3, 1},
 };
 
-const volatile __u64 NOW_DSQ = 0x1000ULL;
-const volatile __u64 LATER_DSQ = 0x2000ULL;
-
 volatile __u32 g_rr_cpu;
-
 /*
 select_cpu → enqueue → dispatch
 select_cpuで直入れしたらenqueueは飛ばされる
 */
-
 const volatile __s32 rising_degC[4] = { 0, 67, 72, 77 };
 const volatile __s32 falling_degC[4] = { 0, 64, 69, 74 };
 
-
-
 const volatile __s32 g_filter_tz_id = -1;
 
-
 volatile __u32 g_stage = STG_COOL;
-
 
 static __always_inline __u32 next_stage_hysteresis(__u32 cur, int temp_mC, const __s32 *rC, const __s32 *dC)
 {
     const int r_warm_mC = rC[1] * 1000;
     const int r_hot_mC  = rC[2] * 1000;
+    const int r_nr_mC   = rC[3] * 1000;
 
-    const int d_warm_mC = dC[1] * 1000;
-    const int d_cool_mC = dC[1] ? dC[0] * 1000 : 0; 
+    const int d_hot_mC  = dC[3] * 1000;
+    const int d_warm_mC = dC[2] * 1000;
+    const int d_cool_mC = dC[1] * 1000;
 
     switch (cur) {
     case STG_COOL:
-        if (temp_mC >= r_warm_mC) return STG_WARM;
-        return STG_COOL;
+        return (temp_mC >= r_warm_mC) ? STG_WARM : STG_COOL;
 
     case STG_WARM:
-        if (temp_mC >= r_hot_mC)      
+        if (temp_mC >= r_hot_mC)
 			return STG_HOT;
-        if (temp_mC <  (falling_degC[0] ? d_cool_mC : r_warm_mC - 3000))
-            return STG_COOL;
+        if (temp_mC <  d_cool_mC)
+			return STG_COOL;
         return STG_WARM;
 
     case STG_HOT:
-        if (temp_mC <  d_warm_mC)    
+        if (temp_mC >= r_nr_mC)
+			return STG_NR;
+        if (temp_mC <  d_warm_mC)
 			return STG_WARM;
-		
-		return STG_HOT;
+        return STG_HOT;
+
+    case STG_NR:
+    default:
+        return (temp_mC < d_hot_mC) ? STG_HOT : STG_NR;
     }
-    if (temp_mC >= r_hot_mC)  return STG_HOT;
-    if (temp_mC >= r_warm_mC) return STG_WARM;
-    return STG_COOL;
 }
 
 static __always_inline bool determine_tof(const struct task_struct *p)
 {
-	if ((p->policy == SCHED_DEADLINE) || p->dl_throttled == 1 || p->dl_non_contending == 1)
+	if ((p->policy != SCHED_DEADLINE) || p->dl_throttled == 1 || p->dl_non_contending == 1)
 		return false;
     if ((s64)p->dl.runtime <= 0)
         return false;
 	if (p->dl.dl_boosted)
         return true;
-	s64 laxity = (s64)p->dl.deadline - (s64)scx_bpf_now() - (s64)p->dl.runtime;
+	s64 laxity = (s64)p->dl.deadline - (s64)bpf_ktime_get_ns() - (s64)p->dl.runtime;
 	//return p->policy == SCHED_DEADLINE && p->dl.pi_se && (p->dl.pi_se != &p->dl);
     return laxity > 0;
 }
@@ -129,8 +114,8 @@ static __always_inline s32 pick_idle_cpu012(void)
 		return -1;
     #pragma clang loop unroll(full)
     for (int i = 0; i < 3; i++) {
-        s32 cpu = ALLOWED[i];
-        if (bpf_cpumask_test_cpu(cpu, idle) && cpu_online(cpu))
+        s32 cpu = ALLOWED_CPUS[i];
+        if (bpf_cpumask_test_cpu(cpu, idle))
             return cpu;
     }
     return -1;
@@ -163,7 +148,7 @@ static __always_inline s32 pick_target_cpu(void)
 		}
     }
     g_rr_cpu = best + 1;
-    return best >= 0 ? best & 3 : bpf_get_smp_processor_id();
+    return best >= 0 ? (best & 3) : bpf_get_smp_processor_id();
 }
 
 static __always_inline bool move_one(__u64 src_dsq, s32 target_cpu)
@@ -184,7 +169,7 @@ static __always_inline bool move_one(__u64 src_dsq, s32 target_cpu)
         if (ok) break;
     }
     bpf_iter_scx_dsq_destroy(&it);
-    return true;
+    return ok;
 }
 
 static __always_inline bool dispatch_one_weighted(void)
@@ -200,7 +185,7 @@ static __always_inline bool dispatch_one_weighted(void)
     bool try_now = (credit_now >= credit_later);
 
     for (int turn = 0; turn < 2; turn++) {
-        __u64 dsq = try_now ? NOW_DSQ : LATER_DSQ;
+        __u64 dsq = try_now ? FAST : NORMAL;
         s32 target = pick_target_cpu();
         if (move_one(dsq, target)) {
             if (try_now) 
@@ -223,7 +208,7 @@ s32 BPF_STRUCT_OPS(prototype_select_cpu, struct task_struct *p, s32 prev_cpu, u6
 		if(determine_tof(p)) {
 		s64 laxity = (s64)p->dl.deadline - (s64)bpf_ktime_get_ns()- (s64)p->dl.runtime;
 			if(SLACK_NS - laxity> 0) {
-				scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, /*SCX_SLICE_DEF*/, enq_flags);
+				scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, /*SCX_SLICE_DEF*/, 0);
 				return cpu;
 			}
 		}
@@ -237,13 +222,11 @@ void BPF_STRUCT_OPS(prototype_enqueue, struct task_struct *p, u64 enq_flags)
 	const u64  now_border = 1000000ULL;
 	const u64  later_border = 1000000ULL;
 	if(determine_tof(p)) {
-		if(p->dl.runtime <= new_border) 
-			scx_bpf_dsq_insert(p, FAST, /*SCX_SLICE_DEF*/, enq_flags);
+		if(p->dl.runtime <= now_border) 
+			scx_bpf_dsq_insert(p, FAST, /*SCX_SLICE_DEF*/, 0);
 		else
-			scx_bpf_dsq_insert_vtime(p, NORMAL, /*SCX_SLICE_DEF*/, enq_flags);
+			scx_bpf_dsq_insert_vtime(p, NORMAL, /*SCX_SLICE_DEF*/, 0);
 	}
-
-	
 }
 
 void BPF_STRUCT_OPS(prototype_dequeue, struct task_struct *p, u64 deq_flags)
@@ -262,8 +245,8 @@ void BPF_STRUCT_OPS(prototype_dispatch, s32 cpu, struct task_struct *prev)
 
 
 
-SEC("tracepoint/therm/thermal_temperature")
-int tp_thermal(struct trace_event_raw_thermal_temperature *ctx;)
+SEC("tracepoint/thermal/thermal_temperature")
+int tp_thermal(struct trace_event_raw_thermal_temperature *ctx)
 {
     if (g_filter_tz_id >= 0 && ctx->id != g_filter_tz_id)
         return 0;
@@ -281,17 +264,19 @@ int tp_thermal(struct trace_event_raw_thermal_temperature *ctx;)
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(prototype_init)
 {
-    scx_bpf_create_dsq(EMERGENCY, -1);
     scx_bpf_create_dsq(FAST, -1);
-    scx_bpf_create_dsq(ALWAYS, -1);
     scx_bpf_create_dsq(NORMAL, -1);
-    scx_bpf_create_dsq(LATER, -1);
-    scx_bpf_create_dsq(GOAWAY, -1);
-
+    //scx_bpf_create_dsq(GOAWAY, -1);
+    //scx_bpf_create_dsq(EMERGENCY, -1);
+    //scx_bpf_create_dsq(ALWAYS, -1);
+    //scx_bpf_create_dsq(LATER, -1);
+	return 0;
 }
 void BPF_STRUCT_OPS(prototype_exit, struct scx_exit_info *ei)
 {
-    scx_bpf_destroy_dsq(FALLBACK_DSQ_ID);
+    scx_bpf_destroy_dsq(FAST);
+    scx_bpf_destroy_dsq(NORMAL);
+    //scx_bpf_destroy_dsq(GOAWAY);
 }
 
 s32 BPF_STRUCT_OPS(prototype_init_task, struct task_struct *p, struct scx_init_task_args *args) 
@@ -299,14 +284,12 @@ s32 BPF_STRUCT_OPS(prototype_init_task, struct task_struct *p, struct scx_init_t
 	return 0;
 }
 
-SCX_OPS_DEFINE(prototype_ops,
-.select_cpu = (void *)prototype_select_cpu,
-.enqueue = (void *)prototype_enqueue,
-.dispatch = (void *)prototype_dispatch,
-.dequeue = (void *)prototype_dequeue,
-.init = (void *)prototype_init,
-.init_task = (void *)prototype_init_task,
-.exit = (void *)prototype_exit,
-. = (void *)prototype_,
-
-.name = "scx_prototype");
+SEC(".struct_ops") struct sched_ext_ops prototype_ops = {
+.select_cpu	= (void *)prototype_select_cpu,
+.enqueue 	= (void *)prototype_enqueue,
+.dispatch 	= (void *)prototype_dispatch,
+.dequeue 	= (void *)prototype_dequeue,
+.init 		= (void *)prototype_init,
+.init_task 	= (void *)prototype_init_task,
+.exit 		= (void *)prototype_exit,
+.name 		= "scx_prototype"};
